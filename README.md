@@ -42,12 +42,16 @@ $$
 5. $A^\pi(s_t, a_t)$. $R(\tau)$为优势函数，Advantage Actor-Critic方法。
 6. $r_t+V^\pi(s_{t+1})-V^\pi(s_t)$. $R(\tau)$为TD误差，Actor-Critic方法。
 
+---
+
 ### RLOO
 REINFORCE Leave One Out (RLOO)方法是对REINFORCE的改进，旨在降低方差。区别在于，RLOO采用所有其他样本的平均回报作为基线，而非仅含有当前样本的回报。具体来说，RLOO维护一个轨迹batch，并引入离群基线：
 $$
 b(s_t) = \frac{1}{N-1} \sum_{i \neq t} G_i
 $$
 该基线不含当前轨迹的信息，因此依然保持无偏性。由于能够利用其他样本的信息，RLOO的基线更为精准，方差通常低于REINFORCE。
+
+---
 
 ### Proximal Policy Optimization (PPO)
 PPO在原生PG的基础上引入了一个剪切的surrogate objective来控制每次更新的幅度，将原先直接加权的$A_t$换成了带剪切的比率形式：
@@ -58,6 +62,8 @@ PPO通过裁剪方式限制了策略更新的幅度，避免了过大的更新�
 $$
 r_t(\theta) = \frac{\pi_\theta(a_t | s_t)}{\pi_{\theta_{\text{old}}}(a_t | s_t)}$$
 PPO在保持PG算法梯度灵活性的同时，通过限制更新幅度来提高训练的稳定性和收敛速度。
+
+---
 
 ### Group Relative Policy Optimization (GRPO)
 GRPO（Group Relative Policy Optimization）是一种针对大模型 RLHF 的无 Critic、基于 REINFORCE 的 PPO 变体。它的核心在于用“组内比较”来估计优势，从而省略价值网络、节省显存，并保持较低方差。
@@ -91,6 +97,108 @@ $$
 \max_\theta \mathbb{E}_{i\in\text{Group}, a_i\sim \pi_theta} \left[ \min(r_iA_i, \text{clip}(r_i, 1-\epsilon, 1+\epsilon)A_i) \right] - \beta \mathbb{E}_s\left[D_{KL}(\pi_\theta(\cdot|s)||\pi_{ref}(\cdot|s))\right]
 $$
 
+### 异步性问题
+大语言模型在RLHF的时候，生成（rollout）和训练（update）的协同是一个关键问题。
+#### 同步On-Policy
+在一张GPU上，先用当前策略生成样本，然后马上用这些样本来更新策略。这样做的好处是简单直接，容易实现，但缺点是样本利用率低，因为每次更新都需要等待新的样本生成。
+#### 分离式On-Policy
+将生成放在GPU1，训练放在GPU2。GPU1生成样本，GPU2使用这些样本来更新策略。GPU1每生成完一批样本，就将它们传给GPU2进行更新。这样可以提高样本利用率，但仍然存在延迟问题，因为GPU2需要等待GPU1生成完样本才能进行更新。
+#### 高效Off-Policy
+在GPU1上生成样本，GPU2上训练策略。GPU1生成样本后，将它们存储在一个缓冲区中，GPU2可以从这个缓冲区中随机抽取样本进行更新。这样可以提高样本利用率，并且GPU2可以在等待新样本的同时进行训练。但是，这种方法需要处理样本的相关性问题，因为生成的样本可能与当前策略不一致，需要额外关注收敛稳定性和学习信号的一致性。
+#### 实践中的常用做法
+用像 Ray RLlib 或自研的分布式进程管理框架，将推理服务（VLLM、TensorRT）和训练服务拆到不同节点。生成端不断往数据队列里塞样本，训练端不断消费并更新模型。关键挑战在于：
+- 异步带来的延迟偏差（policy lag）会影响策略梯度的准确性；
+- 要设计合适的重放缓冲区策略（如优先级、最新策略裁剪），以兼顾样本多样性和新旧策略偏差；
+- 同时要用KL 约束、学习率调整等手段，保持训练稳定。
+
+---
+
+### Generalized Advantage Estimation (GAE)
+广义优势估计 (GAE) 是计算策略梯度算法优势的另一种方法，它能够更好地平衡偏差-方差权衡。传统的单步优势估计可能会引入过多的偏差，而使用完整轨迹往往会产生较高的方差。GAE 的工作原理是结合两种思路——多步预测和加权移动平均（或两者兼而有之）。
+
+定义n步长优势估计：
+$$
+\hat{A}_t^{(n)} = \sum_{l=0}^{n-1} \gamma^l r_{t+l} + \gamma^n V(s_{t+n}) - V(s_t)
+$$
+较小的n会导致低方差，但偏差较大。定义时序差分残差
+$$
+\delta_t^V= r_t + \gamma V(s_{t+1}) - V(s_t)
+$$
+GAE通过引入一个衰减因子$\lambda$来在所有不同的n步长优势估计之间进行平滑过渡：
+$$
+\begin{aligned}
+\hat{A}_t^{\text{GAE}} &= (1-\lambda) \sum_{l=1}^{\infty} \lambda^{l-1} \hat{A}_t^{(l)}\\
+& = (1-\lambda) \sum_{l=1}^{\infty} \lambda^{l-1} \left( \sum_{k=0}^{l-1} \gamma^k r_{t+k} + \gamma^l V(s_{t+l}) - V(s_t) \right)\\
+& = (1-\lambda) \sum_{l=1}^{\infty} \lambda^{l-1} \left( \sum_{k=0}^{l-1} \gamma^k \delta_{t+k}^V \right)\\
+& = (1-\lambda) \sum_{k=0}^\infty \gamma^k\delta_{t+k}\sum_{l=k+1}^{\infty} \lambda^{l-k-1}\\
+& = (1-\lambda) \sum_{k=0}^\infty \frac{\lambda^k}{1-\lambda}\gamma^k\delta_{t+k}^V \\
+& = \sum_{l=0}^{\infty} (\gamma \lambda)^l \delta_{t+l}^V
+\end{aligned}
+$$
+
+---
+
+### Trust Region Policy Optimization (TRPO)
+Trust Region Policy Optimization (TRPO) 是 Schulman 等人于 2015 年提出的一种稳定且高效的策略梯度方法，通过在“信赖域”（trust region）内限制每次策略更新的幅度，来避免策略发生“跳跃式”退化。
+TRPO 的核心思想是通过约束策略更新的 KL 散度来限制每次更新的幅度。具体来说，TRPO 通过以下优化目标来更新策略：
+$$
+\begin{aligned}
+&\max_\theta\quad 
+\mathbb{E}_{s,a\sim\pi_{\theta_{\rm old}}}
+\Bigl[\frac{\pi_\theta(a\mid s)}{\pi_{\theta_{\rm old}}(a\mid s)}\,A^{\pi_{\rm old}}(s,a)\Bigr] \\[6pt]
+&\text{subject to}\quad 
+\mathbb{E}_{s\sim d^{\pi_{\rm old}}}\bigl[\,D_{\rm KL}\bigl(\pi_{\theta_{\rm old}}(\cdot\mid s)\,\|\,\pi_\theta(\cdot\mid s)\bigr)\bigr]
+\;\le\;\delta,
+\end{aligned}
+$$
+其优点在于每次更新都有严格的KL散度保证，性能稳定。理论上接近自然梯度，收敛快而样本效率高。与PPO相比，TRPO直接优化二次子问题，约束更精确，在复杂环境下能取得更优秀的性能。 但是其实现较为复杂，计算开销大，尤其在大模型上需要更多的计算资源和内存。
+
+---
+
+### Deterministic Policy Gradient (DPG)
+Deterministic Policy Gradient (DPG) 是 Silver et al. 在 2014 年提出的一种基于策略梯度的强化学习方法，专门用于连续动作空间，核心思想是将随机策略换成“确定性”策略，从而大幅降低策略梯度方差，并且能够天然地做离线（off‐policy）学习。
+DPG 的核心思想是将策略函数 $\pi_\theta(s)$ 直接映射到动作空间，而不是通过概率分布采样动作。DPG的Actor网络直接输出一个确定性动作$a=\mu_\theta(s)$，目标函数为
+$$
+J(\theta) = \mathbb{E}_{s\sim \rho^\beta} \left[ Q_{\phi}(s, \mu_\theta(s)) \right]
+$$
+其中$\rho^\beta$是行为策略的状态分布，$Q_{\phi}(s, a)$是动作价值函数。DPG的梯度更新为
+$$
+\nabla_\theta J(\theta) = \mathbb{E}_{s\sim \rho^\beta} \left[ \nabla_a Q_{\phi}(s, a) \bigg|_{a=\mu_\theta(s)} \nabla_\theta \mu_\theta(s) \right]
+$$
+其中$\nabla_a Q_{\phi}(s, a)$由Critic网络得到，$\nabla_\theta \mu_\theta(s)$是Actor网络的Jacobian。
+DDPG（Deep Deterministic Policy Gradient）是 DPG 的深度学习扩展，结合了深度神经网络和经验回放（experience replay）机制。DDPG使用Actor-Critic架构，其中Actor网络输出确定性动作，Critic网络估计动作价值函数。DDPG的更新步骤包括：
+1. 从经验回放缓冲区中采样一批$(s, a, r, s')$样本；
+2. Target网络：维护慢更新的目标网络$Q_{\phi'}$和$\mu_{\theta'}$，通过软更新$\phi' \leftarrow \tau \phi + (1 - \tau) \phi'$和$\theta' \leftarrow \tau \theta + (1 - \tau) \theta'$来稳定训练；
+3. 探索噪声：在线执行时在Actor输出的动作上添加噪声（如Ornstein-Uhlenbeck噪声）来鼓励探索；
+4. 更新Critic网络：使用Bellman方程更新Critic网络的参数$\phi$。Critic更新若干步之后，再做一次Actor网络的更新。
+5. 
+| 特性     | 优点                                        | 缺点                                             |
+| ------ | ----------------------------------------- | ---------------------------------------------- |
+| 样本效率   | 离线学习（off‐policy）＋经验重用 → 样本利用率高            | 如果行为分布与目标策略差距大，可能引入偏差（off‐policy bias）         |
+| 方差     | 确定性策略“消除”了随机策略的方差来源 → 梯度方差低               | Critic 拟合 Q(s,a) 难度大 → 易发散，需要大量调参与技巧           |
+| 连续动作支持 | 直接输出连续动作，无需对动作分布求导                        | 难以处理离散动作；在高维动作空间中依赖良好的探索噪声                     |
+| 算法复杂度  | 只需一个 Actor＋一个 Critic，结合 Target 网络和回放池即可实现 | 需要维护 Target 网络、回放池、探索噪声、超参（学习率、τ、Batch Size）众多 |
+
+DDPG适用于连续控制任务，例如机器人控制、自动驾驶、高维机械臂、模拟物理控制等。同时，对于样本宝贵但是可以离线记录的任务（如游戏回放、模拟器数据），DDPG也能发挥优势。
+
+---
+
+### Soft Actor-Critic (SAC)
+
+Soft Actor–Critic (SAC) 是一款基于最大化“回报＋策略熵”目标的 off-policy Actor–Critic 算法，兼顾了高样本效率和良好探索性，特别适合连续动作空间。普通 RL 只追求最大化期望回报，往往在策略收敛后会变得过于确定性（deterministic），缺少探索。最大熵框架 在目标里加入策略熵项
+$$
+J(\pi)=\sum_{t}\mathbb{E}_{(s_t,a_t)\sim\pi}\Bigl[r(s_t,a_t)+\alpha\,\mathcal{H}\bigl(\pi(\cdot\mid s_t)\bigr)\Bigr]
+$$
+在保证高回报的同时，鼓励策略保持一定的随机性，从而提高探索性。SAC中Critic包含两个价值网络$Q_{\phi_1}, Q_{\phi_2}$以避免过高估计偏差，目标值采用两个网络中的较小值：
+$$
+y = r + \gamma\Bigl[\min_{i=1,2}Q_{\bar\phi_i}(s',a') - \alpha\ln\pi_\theta(a'\mid s')\Bigr]
+$$
+其中 $a'\sim\pi_\theta(\cdot\mid s')$，$\bar\phi_i$ 为延迟更新的 target 网络参数。Actor参数化为高斯分布 $\pi_\theta(a\mid s)=\mathcal{N}(\mu_\theta(s),\sigma_\theta(s))$，对连续动作做 reparameterization（如$a=\tanh(\mu_\theta(s)+\sigma_\theta(s)\odot\epsilon)$，$\epsilon\sim\mathcal{N}(0,I)$）。优化目标为最大化 Q 减去熵成本：
+$$
+J(\theta)=\mathbb{E}_{s\sim\mathcal{D},\,\epsilon}\Bigl[\alpha\ln\pi_\theta(a\mid s)-Q_{\phi}(s,a)\Bigr].
+$$
+SAC算法的优点在于高样本效率（off-policy）和高稳定性，并且可学习的温度参数可以自动调整探索的强度，在连续动作空间中具有广泛应用。缺点是复杂度高，超参数多，并且在高维动作下需要小心设计以调节噪声。
+
 
 
 ### 一些思考题
@@ -117,3 +225,21 @@ $$
 3. 为什么说 Actor–Critic 在样本利用率上优于蒙特卡洛方法？请结合 TD 残差与 bootstrapping 的概念说明两者在数据使用和更新频率上的差别。
    - REINFORCE方法属于蒙特卡罗采样，每次更新都需要等待整个episode结束才能计算回报。更新只能在每个episode结束后一次性完成，轨迹数据用完即丢弃。一条轨迹仅贡献一次梯度更新。
    - Actor-Critic在与环境交互的每一步都能计算一次TD残差，并立即用它更新策略和价值函数。每一步都能利用当前状态和动作的反馈进行更新，样本利用率更高。一条轨迹能贡献$T$次梯度更新。AC通过bootstrapping利用当前状态的价值估计来更新策略和价值函数，而不是等待整个轨迹结束。这样可以更快地适应环境变化，提高学习效率。
+
+4. 在GAE中，当 $\lambda$ 从 0 变到 1 时，算法行为如何变化？在什么场景下倾向于选择较大或较小的 $\lambda$？
+   - 当 $\lambda$ 从 0 变到 1 时，GAE的优势估计从单步TD残差（低偏差、高方差）逐渐过渡到多步回报（高偏差、低方差）。具体来说：
+     - $\lambda=0$ 时，GAE等价于单步TD残差，优势估计仅依赖于当前状态和下一个状态的回报，方差最小，但偏差较大。
+     - $\lambda=1$ 时，GAE等价于完整轨迹的回报，优势估计依赖于整个轨迹的回报，偏差最小，但方差较大。
+     - 在 $\lambda$ 介于 0 和 1 之间时，GAE通过加权平均多步回报来平衡偏差和方差。
+   - 选择大$\lambda$的情况：
+     - 环境确定性高、奖励信号稳定。模拟器噪声小或奖励延迟长，需要更准确的长期回报估计；价值网络易于收敛且误差小，可放心依赖较少的 bootstrapping。
+     - 追求策略无偏性。想尽量减少对价值网络的依赖，获得更“真实”的期望回报；适用于 offline RL、批量评估，或对最终性能精度要求高的场景。
+     - 样本充足、计算可承受。可以接受更高的方差带来的抖动，只要长期收敛性更好；有充足的样本或大 batch 来平均掉噪声。
+   - 选择小$\lambda$的情况：
+     - 环境噪声大、奖励稀疏或不稳定。需要更快地适应环境变化。
+     - 策略更新频繁。在高频率小步长更新（如异步并行、大模型微调等）下，用一步TD能保持更稳定的学习信号。
+     - 样本稀缺、计算资源有限。需要更快地收敛，减少每次更新的方差；样本量小或 batch size 小，无法承受高方差带来的抖动。适合实时、在线学习、机器人控制、小游戏或短会和任务。
+   - 实践经验：
+     - PPO/A2C 通常使用 $\lambda \in [0.9, 0.98]$.
+     - 对于长期依赖（CoT，长对话）任务，$\lambda$ 可以设置得更大到0.99.
+     - 对于高速在线控制或非常嘈杂的环境，可以降到0.8或更低。
